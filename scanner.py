@@ -214,10 +214,20 @@ def check_vulnerability(host: str, timeout: int = 10, verify_ssl: bool = True, f
         response_str += f"\r\n{response.text[:2000]}"
         result["response"] = response_str
 
+        # Check for Vercel/Netlify mitigations (not valid findings)
+        server_header = response.headers.get("Server", "").lower()
+        has_netlify_vary = "Netlify-Vary" in response.headers
+        is_mitigated = (
+            has_netlify_vary
+            or server_header == "netlify"
+            or server_header == "vercel"
+        )
+
         # Check vulnerability indicators:
         # 1. Status code 500
         # 2. Response contains 'E{"digest"'
-        if response.status_code == 500 and 'E{"digest"' in response.text:
+        # 3. Not hosted on Vercel/Netlify (they have custom mitigations)
+        if response.status_code == 500 and 'E{"digest"' in response.text and not is_mitigated:
             result["vulnerable"] = True
         else:
             result["vulnerable"] = False
