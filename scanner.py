@@ -54,6 +54,21 @@ def print_banner():
     print(banner)
 
 
+def parse_headers(header_list: list[str] | None) -> dict[str, str]:
+    """Parse a list of 'Key: Value' strings into a dict."""
+    headers = {}
+    if not header_list:
+        return headers
+    for header in header_list:
+        if ": " in header:
+            key, value = header.split(": ", 1)
+            headers[key] = value
+        elif ":" in header:
+            key, value = header.split(":", 1)
+            headers[key] = value.lstrip()
+    return headers
+
+
 def normalize_host(host: str) -> str:
     """Normalize host to include scheme if missing."""
     host = host.strip()
@@ -83,8 +98,10 @@ def build_payload() -> tuple[str, str]:
 
 
 def resolve_redirects(url: str, timeout: int, verify_ssl: bool, max_redirects: int = 10) -> str:
-    """Follow redirects using HEAD requests to find the final URL."""
+    """Follow redirects only if they stay on the same host."""
     current_url = url
+    original_host = urlparse(url).netloc
+
     for _ in range(max_redirects):
         try:
             response = requests.head(
@@ -97,10 +114,16 @@ def resolve_redirects(url: str, timeout: int, verify_ssl: bool, max_redirects: i
                 location = response.headers.get("Location")
                 if location:
                     if location.startswith("/"):
+                        # Relative redirect - same host, safe to follow
                         parsed = urlparse(current_url)
                         current_url = f"{parsed.scheme}://{parsed.netloc}{location}"
                     else:
-                        current_url = location
+                        # Absolute redirect - check if same host
+                        new_host = urlparse(location).netloc
+                        if new_host == original_host:
+                            current_url = location
+                        else:
+                            break  # Different host, stop following
                 else:
                     break
             else:
@@ -110,7 +133,7 @@ def resolve_redirects(url: str, timeout: int, verify_ssl: bool, max_redirects: i
     return current_url
 
 
-def check_vulnerability(host: str, timeout: int = 10, verify_ssl: bool = True, follow_redirects: bool = True) -> dict:
+def check_vulnerability(host: str, timeout: int = 10, verify_ssl: bool = True, follow_redirects: bool = True, custom_headers: dict[str, str] | None = None) -> dict:
     """
     Check if a host is vulnerable to CVE-2025-55182/CVE-2025-66478.
 
@@ -159,6 +182,10 @@ def check_vulnerability(host: str, timeout: int = 10, verify_ssl: bool = True, f
         "Content-Type": content_type,
         "X-Nextjs-Html-Request-Id": "SSTMXm7OJ_g0Ncx6jpQt9",
     }
+
+    # Apply custom headers (override defaults)
+    if custom_headers:
+        headers.update(custom_headers)
 
     parsed = urlparse(target_url)
     request_str = f"POST {parsed.path or '/'} HTTP/1.1\r\n"
@@ -282,6 +309,7 @@ Examples:
   %(prog)s -u https://example.com
   %(prog)s -l hosts.txt -t 20 -o results.json
   %(prog)s -l hosts.txt --threads 50 --timeout 15
+  %(prog)s -u https://example.com -H "Authorization: Bearer token" -H "User-Agent: CustomAgent"
         """
     )
 
@@ -325,6 +353,14 @@ Examples:
         default=True,
         action="store_true",
         help="Disable SSL certificate verification"
+    )
+
+    parser.add_argument(
+        "-H", "--header",
+        action="append",
+        dest="headers",
+        metavar="HEADER",
+        help="Custom header in 'Key: Value' format (can be used multiple times)"
     )
 
     parser.add_argument(
@@ -383,13 +419,14 @@ Examples:
     error_count = 0
 
     verify_ssl = not args.insecure
+    custom_headers = parse_headers(args.headers)
 
     if args.insecure:
         import urllib3
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
     if len(hosts) == 1:
-        result = check_vulnerability(hosts[0], args.timeout, verify_ssl)
+        result = check_vulnerability(hosts[0], args.timeout, verify_ssl, custom_headers=custom_headers)
         results.append(result)
         if not args.quiet or result["vulnerable"]:
             print_result(result, args.verbose)
@@ -398,7 +435,7 @@ Examples:
     else:
         with ThreadPoolExecutor(max_workers=args.threads) as executor:
             futures = {
-                executor.submit(check_vulnerability, host, args.timeout, verify_ssl): host
+                executor.submit(check_vulnerability, host, args.timeout, verify_ssl, custom_headers=custom_headers): host
                 for host in hosts
             }
 
