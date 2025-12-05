@@ -426,12 +426,11 @@ def print_result(result: dict, verbose: bool = False):
         error_msg = result.get("error", "Unknown error")
         print(f"{status} {host} - {error_msg}")
 
-    if verbose and result["vulnerable"]:
+    if verbose and result.get("response"):
         print(colorize("  Response snippet:", Colors.CYAN))
-        if result.get("response"):
-            lines = result["response"].split("\r\n")[:10]
-            for line in lines:
-                print(f"    {line}")
+        lines = result["response"].split("\r\n")[:10]
+        for line in lines:
+            print(f"    {line}")
 
 
 def main():
@@ -500,7 +499,7 @@ Examples:
     parser.add_argument(
         "-v", "--verbose",
         action="store_true",
-        help="Verbose output (show response snippets for vulnerable hosts)"
+        help="Verbose output (show response snippets for all hosts)"
     )
 
     parser.add_argument(
