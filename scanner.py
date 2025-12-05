@@ -248,7 +248,7 @@ def is_vulnerable_rce_check(response: requests.Response) -> bool:
     return bool(re.search(r'.*/login\?a=11111.*', redirect_header))
 
 
-def check_vulnerability(host: str, timeout: int = 10, verify_ssl: bool = True, follow_redirects: bool = True, custom_headers: Optional[dict[str, str]] = None, safe_check: bool = False, windows: bool = False, waf_bypass: bool = False, waf_bypass_size_kb: int = 128) -> dict:
+def check_vulnerability(host: str, timeout: int = 10, verify_ssl: bool = True, follow_redirects: bool = True, custom_headers: Optional[dict[str, str]] = None, safe_check: bool = False, windows: bool = False, waf_bypass: bool = False, waf_bypass_size_kb: int = 128, paths: Optional[list[str]] = None) -> dict:
     """
     Check if a host is vulnerable to CVE-2025-55182/CVE-2025-66478.
 
@@ -278,7 +278,11 @@ def check_vulnerability(host: str, timeout: int = 10, verify_ssl: bool = True, f
         result["error"] = "Invalid or empty host"
         return result
 
-    root_url = f"{host}/"
+    # Determine which paths to test
+    if paths:
+        test_paths = paths
+    else:
+        test_paths = ["/"]  # Default to root path
 
     if safe_check:
         body, content_type = build_safe_payload()
@@ -316,52 +320,66 @@ def check_vulnerability(host: str, timeout: int = 10, verify_ssl: bool = True, f
         resp_str += f"\r\n{resp.text[:2000]}"
         return resp_str
 
-    # First, test the root path
-    result["final_url"] = root_url
-    result["request"] = build_request_str(root_url)
+    # Test each path
+    for idx, path in enumerate(test_paths):
+        # Ensure path starts with /
+        if not path.startswith("/"):
+            path = "/" + path
+        
+        test_url = f"{host}{path}"
+        
+        # First, test the path
+        result["final_url"] = test_url
+        result["request"] = build_request_str(test_url)
 
-    response, error = send_payload(root_url, headers, body, timeout, verify_ssl)
+        response, error = send_payload(test_url, headers, body, timeout, verify_ssl)
 
-    if error:
-        # In RCE mode, timeouts indicate not vulnerable (patched servers hang)
-        if not safe_check and error == "Request timed out":
-            result["vulnerable"] = False
+        if error:
+            # In RCE mode, timeouts indicate not vulnerable (patched servers hang)
+            if not safe_check and error == "Request timed out":
+                result["vulnerable"] = False
+                result["error"] = error
+                # Continue to next path if there are more, otherwise return
+                if idx < len(test_paths) - 1:
+                    continue
+                return result
+            # For other errors, continue to next path unless it's the last one
+            if idx < len(test_paths) - 1:
+                continue
             result["error"] = error
             return result
-        result["error"] = error
-        return result
 
-    result["status_code"] = response.status_code
-    result["response"] = build_response_str(response)
+        result["status_code"] = response.status_code
+        result["response"] = build_response_str(response)
 
-    if is_vulnerable(response):
-        result["vulnerable"] = True
-        return result
+        if is_vulnerable(response):
+            result["vulnerable"] = True
+            return result
 
-    # Root not vulnerable - try redirect path if enabled
-    if follow_redirects:
-        try:
-            redirect_url = resolve_redirects(root_url, timeout, verify_ssl)
-            if redirect_url != root_url:
-                # Different path, test it
-                response, error = send_payload(redirect_url, headers, body, timeout, verify_ssl)
+        # Path not vulnerable - try redirect path if enabled
+        if follow_redirects:
+            try:
+                redirect_url = resolve_redirects(test_url, timeout, verify_ssl)
+                if redirect_url != test_url:
+                    # Different path, test it
+                    response, error = send_payload(redirect_url, headers, body, timeout, verify_ssl)
 
-                if error:
-                    # Keep root result but note the redirect failed
-                    result["vulnerable"] = False
-                    return result
+                    if error:
+                        # Continue to next path
+                        continue
 
-                result["final_url"] = redirect_url
-                result["request"] = build_request_str(redirect_url)
-                result["status_code"] = response.status_code
-                result["response"] = build_response_str(response)
+                    result["final_url"] = redirect_url
+                    result["request"] = build_request_str(redirect_url)
+                    result["status_code"] = response.status_code
+                    result["response"] = build_response_str(response)
 
-                if is_vulnerable(response):
-                    result["vulnerable"] = True
-                    return result
-        except Exception:
-            pass  # Continue with root result if redirect resolution fails
+                    if is_vulnerable(response):
+                        result["vulnerable"] = True
+                        return result
+            except Exception:
+                pass  # Continue to next path if redirect resolution fails
 
+    # All paths tested, not vulnerable
     result["vulnerable"] = False
     return result
 
@@ -382,6 +400,27 @@ def load_hosts(hosts_file: str) -> list[str]:
         print(colorize(f"[ERROR] Failed to read file: {e}", Colors.RED))
         sys.exit(1)
     return hosts
+
+
+def load_paths(paths_file: str) -> list[str]:
+    """Load paths from a file, one per line."""
+    paths = []
+    try:
+        with open(paths_file, "r") as f:
+            for line in f:
+                path = line.strip()
+                if path and not path.startswith("#"):
+                    # Ensure path starts with /
+                    if not path.startswith("/"):
+                        path = "/" + path
+                    paths.append(path)
+    except FileNotFoundError:
+        print(colorize(f"[ERROR] File not found: {paths_file}", Colors.RED))
+        sys.exit(1)
+    except Exception as e:
+        print(colorize(f"[ERROR] Failed to read file: {e}", Colors.RED))
+        sys.exit(1)
+    return paths
 
 
 def save_results(results: list[dict], output_file: str, vulnerable_only: bool = True):
@@ -443,6 +482,9 @@ Examples:
   %(prog)s -l hosts.txt -t 20 -o results.json
   %(prog)s -l hosts.txt --threads 50 --timeout 15
   %(prog)s -u https://example.com -H "Authorization: Bearer token" -H "User-Agent: CustomAgent"
+  %(prog)s -u https://example.com --path /_next
+  %(prog)s -u https://example.com --path /_next --path /api
+  %(prog)s -u https://example.com --path-file paths.txt
         """
     )
 
@@ -540,6 +582,18 @@ Examples:
         help="Size of junk data in KB for WAF bypass (default: 128)"
     )
 
+    parser.add_argument(
+        "--path",
+        action="append",
+        dest="paths",
+        help="Custom path to test (e.g., '/_next', '/api'). Can be used multiple times to test multiple paths"
+    )
+
+    parser.add_argument(
+        "--path-file",
+        help="File containing list of paths to test (one per line, e.g., '/_next', '/api')"
+    )
+
     args = parser.parse_args()
 
     if args.no_color or not sys.stdout.isatty():
@@ -565,6 +619,18 @@ Examples:
         print(colorize("[ERROR] No hosts to scan", Colors.RED))
         sys.exit(1)
 
+    # Load paths if specified
+    paths = None
+    if args.path_file:
+        paths = load_paths(args.path_file)
+    elif args.paths:
+        paths = []
+        for path in args.paths:
+            # Ensure path starts with /
+            if not path.startswith("/"):
+                path = "/" + path
+            paths.append(path)
+
     # Adjust timeout for WAF bypass mode
     timeout = args.timeout
     if args.waf_bypass and args.timeout == 10:
@@ -572,6 +638,8 @@ Examples:
 
     if not args.quiet:
         print(colorize(f"[*] Loaded {len(hosts)} host(s) to scan", Colors.CYAN))
+        if paths:
+            print(colorize(f"[*] Testing {len(paths)} path(s): {', '.join(paths)}", Colors.CYAN))
         print(colorize(f"[*] Using {args.threads} thread(s)", Colors.CYAN))
         print(colorize(f"[*] Timeout: {timeout}s", Colors.CYAN))
         if args.safe_check:
@@ -598,7 +666,7 @@ Examples:
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
     if len(hosts) == 1:
-        result = check_vulnerability(hosts[0], timeout, verify_ssl, custom_headers=custom_headers, safe_check=args.safe_check, windows=args.windows, waf_bypass=args.waf_bypass, waf_bypass_size_kb=args.waf_bypass_size)
+        result = check_vulnerability(hosts[0], timeout, verify_ssl, custom_headers=custom_headers, safe_check=args.safe_check, windows=args.windows, waf_bypass=args.waf_bypass, waf_bypass_size_kb=args.waf_bypass_size, paths=paths)
         results.append(result)
         if not args.quiet or result["vulnerable"]:
             print_result(result, args.verbose)
@@ -607,7 +675,7 @@ Examples:
     else:
         with ThreadPoolExecutor(max_workers=args.threads) as executor:
             futures = {
-                executor.submit(check_vulnerability, host, timeout, verify_ssl, custom_headers=custom_headers, safe_check=args.safe_check, windows=args.windows, waf_bypass=args.waf_bypass, waf_bypass_size_kb=args.waf_bypass_size): host
+                executor.submit(check_vulnerability, host, timeout, verify_ssl, custom_headers=custom_headers, safe_check=args.safe_check, windows=args.windows, waf_bypass=args.waf_bypass, waf_bypass_size_kb=args.waf_bypass_size, paths=paths): host
                 for host in hosts
             }
 
